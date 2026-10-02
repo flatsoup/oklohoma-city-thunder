@@ -1,0 +1,11 @@
+numpy==2.5.3
+pandas==3.0.6
+scikit-learn==1.9.1
+scipy==1.18.1
+lightgbm==4.7.0
+matplotlib==3.11.2
+sportypy==1.0.0
+# writeup build only (scripts/build_writeup.py)
+fpdf2==2.8.9
+python-docx==1.2.0
+pillow==12.3.0

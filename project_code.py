@@ -1,4 +1,4 @@
-# NAME: Bogdan Khudoidodov | NUMBER: TODO_FILL_LAST4DIGITS
+# NAME: Bogdan Khudoidodov | NUMBER: 0806
 """
 project_code.py
 OKC Analyst Intern Project -- NBA shot make-probability model.
@@ -17,8 +17,10 @@ Pipeline:
   4. Modeling: LightGBM (primary) bagged over a 5-fold Stratified K-Fold, blended with a
      spline Logistic Regression baseline when the blend improves OOF log-loss.
   5. Diagnostics: feature importance, SHAP-style contribution plots (via LightGBM's native
-     pred_contrib, no extra heavy dependency), calibration plot, and a season-holdout
-     generalization check (see note below on why this matters for this dataset).
+     pred_contrib, no extra heavy dependency), calibration plot, a season-holdout
+     generalization check (see note below on why this matters for this dataset), and a
+     hot/neutral/cold court shot chart (smoothed FG% via Gaussian KDE, drawn on a
+     `sportypy` NBA court).
   6. Writes final predictions into submission.csv (preserving the template's row order).
 
 NOTE on season_id (important modeling decision -- see project_writeup for details):
@@ -33,7 +35,6 @@ NOTE on season_id (important modeling decision -- see project_writeup for detail
         when scoring against testing.csv.
 """
 
-import re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -47,6 +48,10 @@ import lightgbm as lgb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from scipy.stats import gaussian_kde
+from scipy.ndimage import gaussian_filter
+from sportypy.surfaces.basketball import NBACourt
 
 RANDOM_STATE = 42
 N_FOLDS = 5
@@ -56,8 +61,10 @@ ROOT = Path(__file__).resolve().parent
 TRAIN_PATH = ROOT / "training.csv.gz"
 TEST_PATH = ROOT / "testing.csv.gz"
 SUBMISSION_TEMPLATE_PATH = ROOT / "submission.csv"
-FIGURES_DIR = ROOT / "project_writeup_assets"
-FIGURES_DIR.mkdir(exist_ok=True)
+OUTPUTS_DIR = ROOT / "outputs"
+FIGURES_DIR = OUTPUTS_DIR / "figures"
+METRICS_PATH = OUTPUTS_DIR / "metrics_summary.json"
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_ENCODE_COLS = {
     # column -> smoothing strength (higher = trust the global mean more for low-count cats)
@@ -482,6 +489,90 @@ def plot_calibration(y_true, y_pred, path, n_bins=15):
     plt.close(fig)
 
 
+# Saturated diverging scale for the court charts: deep blue (cold) -> gray (league
+# average) -> deep red (hot). Strong ends so zones stay readable on a white floor.
+HOTCOLD_CMAP = LinearSegmentedColormap.from_list(
+    "hotcold", ["#0030c0", "#3d7bff", "#c8c8c8", "#ff4d3d", "#c00000"])
+HOTCOLD_CMAP.set_bad(alpha=0)
+# sportypy draws court fills at zorder <= 7 and court lines at zorder >= 16, so a heatmap
+# drawn in between keeps the lines (3PT arc, paint, ...) visible on top of the colors.
+COURT_HEATMAP_ZORDER = 10
+
+
+def draw_white_court(ax):
+    """sportypy NBA half court with a plain white floor instead of the default wood."""
+    fills = ["defensive_half_court", "offensive_half_court", "court_apron", "two_point_range",
+             "painted_area", "free_throw_circle_fill"]
+    colors = {f: "#ffffff" for f in fills}
+    colors["center_circle_fill"] = ["#ffffff", "#ffffff"]  # outer + inner center circle
+    NBACourt(color_updates=colors).draw(ax=ax, display_range="offense")
+
+
+def plot_shotchart_hotcold(train, path):
+    """Hot/neutral/cold shot chart: a smoothed FG% surface over the half court.
+
+    Rather than a single sns.kdeplot call, this fits TWO Gaussian KDEs (one on made
+    shots, one on missed shots -- the same kernel-density technique sns.kdeplot uses
+    under the hood) because seaborn/scipy KDE weights must be non-negative, so a single
+    signed-weight density isn't supported. Combining the two densities gives a smoothed,
+    local "percent of nearby shots that went in" surface: local_fg(x,y) = make_density /
+    (make_density + miss_density). Areas with too few nearby shots to estimate reliably
+    are masked out (transparent) rather than extrapolated.
+
+    Court drawn with `sportypy` (NBACourt), which happens to use the same real-world
+    foot-based coordinate convention as this dataset (basket 5.25 ft from the baseline,
+    94/50 ft full-court dimensions) once locationx is sign-flipped to match sportypy's
+    "offense" half-court orientation (hoop at positive x, vs. this dataset's negative x).
+    """
+    court_x = -train["locationx"].values
+    court_y = train["locationy"].values
+    made = train["outcome"].values.astype(bool)
+    global_fg = train["outcome"].mean()
+
+    rng = np.random.RandomState(RANDOM_STATE)
+    max_per_class = 15000
+
+    def subsample(mask):
+        idx = np.where(mask)[0]
+        if len(idx) > max_per_class:
+            idx = rng.choice(idx, max_per_class, replace=False)
+        return idx
+
+    make_idx, miss_idx = subsample(made), subsample(~made)
+
+    gx, gy = np.mgrid[0:47:200j, -25:25:200j]
+    grid = np.vstack([gx.ravel(), gy.ravel()])
+    kde_make = gaussian_kde(np.vstack([court_x[make_idx], court_y[make_idx]]), bw_method=0.14)
+    kde_miss = gaussian_kde(np.vstack([court_x[miss_idx], court_y[miss_idx]]), bw_method=0.14)
+    dens_make = kde_make(grid).reshape(gx.shape) * made.sum()
+    dens_miss = kde_miss(grid).reshape(gx.shape) * (~made).sum()
+    total_density = dens_make + dens_miss
+
+    local_fg = gaussian_filter(dens_make / np.clip(total_density, 1e-9, None), sigma=1.1)
+    sparse_mask = total_density < total_density.max() * 0.025
+    local_fg_masked = np.ma.masked_where(sparse_mask, local_fg)
+
+    vmin = max(0.0, float(local_fg_masked.min()) - 0.02)
+    vmax = min(1.0, float(local_fg_masked.max()) + 0.02)
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=global_fg, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(8.5, 8))
+    draw_white_court(ax)
+    mesh = ax.pcolormesh(gx, gy, local_fg_masked, cmap=HOTCOLD_CMAP, norm=norm, shading="gouraud",
+                          zorder=COURT_HEATMAP_ZORDER)
+    cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
+    cbar.set_label("smoothed FG% (KDE: makes vs. misses)")
+    ticks = sorted(set(round(t, 2) for t in np.linspace(vmin + 0.02, vmax - 0.02, 5)) | {round(global_fg, 3)})
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([f"{t:.0%}" + ("  (avg)" if abs(t - global_fg) < 0.005 else "") for t in ticks], fontsize=8)
+    cbar.ax.axhline(global_fg, color="black", lw=1.3)
+    ax.set_title("Shot hot / neutral / cold zones\n"
+                  "(red = above-average FG%, gray = league-average, blue = below-average)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def plot_zone_fgpct(train, path):
     grp = train.groupby("zone")["outcome"].agg(["mean", "count"]).sort_values("mean")
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -492,6 +583,80 @@ def plot_zone_fgpct(train, path):
     ax.set_title("Observed FG% by court zone (training data)")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+ZONE_LABELS = {
+    "restricted_area": "Restricted",
+    "paint": "Paint",
+    "midrange": "Midrange",
+    "corner_three": "Corner 3",
+    "above_break_three": "Above-break 3",
+}
+
+
+def plot_zone_fgpct_court(train, path, max_dist=30):
+    """Same per-zone FG% as plot_zone_fgpct, but painted onto the court.
+
+    The zone shapes are not hand-drawn polygons: a grid of court points is run through
+    the exact add_geometry_features + add_zone logic used by the model, so the map shows
+    precisely the regions the zone feature means (e.g. "paint" is the <=14 ft ring, and
+    corner_three is the >=62 deg wedge). Colors share the HOTCOLD_CMAP scale of
+    plot_shotchart_hotcold, centered on the league-average FG%.
+    """
+    grp = train.groupby("zone")["outcome"].agg(["mean", "count"])
+    global_fg = train["outcome"].mean()
+    zone_names = list(grp.index)
+
+    # Grid in sportypy "offense" coordinates (hoop at +41.75); dataset x is sign-flipped.
+    gx, gy = np.mgrid[0:47:400j, -25:25:400j]
+    grid = pd.DataFrame({"locationx": -gx.ravel(), "locationy": gy.ravel()})
+    dx, dy = grid["locationx"] - RIM_X, grid["locationy"] - RIM_Y
+    grid["distance"] = np.hypot(dx, dy)
+    # 3PT line: 22 ft straight corners up to where they meet the 23.75 ft arc
+    corner_len = np.sqrt(23.75 ** 2 - 22 ** 2)
+    grid["three"] = np.where(dx <= corner_len, dy.abs() >= 22, grid["distance"] >= 23.75).astype(int)
+    grid = add_zone(add_geometry_features(grid))
+
+    zone_id = grid["zone"].map({z: i for i, z in enumerate(zone_names)}).values.reshape(gx.shape)
+    fg_grid = grid["zone"].map(grp["mean"]).values.reshape(gx.shape)
+    fg_grid = np.ma.masked_where(grid["distance"].values.reshape(gx.shape) > max_dist, fg_grid)
+
+    spread = max(grp["mean"].max() - global_fg, global_fg - grp["mean"].min()) + 0.02
+    norm = TwoSlopeNorm(vmin=global_fg - spread, vcenter=global_fg, vmax=global_fg + spread)
+
+    fig, ax = plt.subplots(figsize=(8.5, 8))
+    draw_white_court(ax)
+    mesh = ax.pcolormesh(gx, gy, fg_grid, cmap=HOTCOLD_CMAP, norm=norm, shading="nearest",
+                          zorder=COURT_HEATMAP_ZORDER)
+    # white borders between zones
+    ax.contour(gx, gy, np.ma.masked_where(np.ma.getmaskarray(fg_grid), zone_id),
+               levels=np.arange(len(zone_names)) + 0.5, colors="white", linewidths=2,
+               zorder=COURT_HEATMAP_ZORDER + 1)
+
+    in_range = ~np.ma.getmaskarray(fg_grid)
+    for i, z in enumerate(zone_names):
+        sel = (zone_id == i) & in_range
+        label = f"{ZONE_LABELS.get(z, z)}\n{grp.loc[z, 'mean']:.1%}\nn={grp.loc[z, 'count']:,}"
+        # ring-shaped zones share a centroid at the rim, so label them on the center line
+        # in front of the hoop; corner_three is two disjoint regions -> label each side
+        if z == "corner_three":
+            parts = [sel & (gy < 0), sel & (gy > 0)]
+        else:
+            parts = [sel & (np.abs(gy) < 1) & (gx <= -RIM_X)]
+        for part in parts:
+            ax.text(gx[part].mean(), gy[part].mean(), label, ha="center", va="center",
+                    fontsize=8, fontweight="bold", color="white", zorder=30,
+                    bbox=dict(boxstyle="round,pad=0.25", fc="black", alpha=0.55, lw=0))
+
+    cbar = fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.02)
+    cbar.set_label("observed FG% in zone")
+    cbar.ax.axhline(global_fg, color="black", lw=1.3)
+    cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax.set_title("Observed FG% by court zone (training data)\n"
+                 f"(red = above league average {global_fg:.1%}, blue = below)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
     plt.close(fig)
 
 
@@ -573,6 +738,8 @@ def main():
                        FIGURES_DIR / "shap_bar.png", FIGURES_DIR / "shap_dependence.png")
     plot_calibration(y, lgbm_oof, FIGURES_DIR / "calibration.png")
     plot_zone_fgpct(train, FIGURES_DIR / "zone_fgpct.png")
+    plot_zone_fgpct_court(train, FIGURES_DIR / "zone_fgpct_court.png")
+    plot_shotchart_hotcold(train, FIGURES_DIR / "shot_hotcold_court.png")
 
     print("=== SUMMARY ===")
     summary = {
@@ -589,7 +756,7 @@ def main():
         print(f"  {k}: {v}")
 
     import json
-    with open(ROOT / "project_writeup_assets" / "metrics_summary.json", "w") as f:
+    with open(METRICS_PATH, "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
     return summary
