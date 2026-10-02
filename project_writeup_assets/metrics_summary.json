@@ -1,0 +1,13 @@
+{
+  "naive_baseline_logloss": 0.6896267573753544,
+  "lightgbm_oof_logloss": 0.6242511930586975,
+  "logreg_spline_oof_logloss": 0.6342029636852536,
+  "blend_weight_lightgbm": 1.0,
+  "blend_oof_logloss": 0.6242511930586975,
+  "used_blend_for_submission": false,
+  "final_oof_logloss": 0.6242511930586975,
+  "season_holdout": {
+    "train=fe055->val=2676a": 0.629813183704823,
+    "train=2676a->val=fe055": 0.625276854023549
+  }
+}
