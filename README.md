@@ -50,5 +50,4 @@ To reproduce:
 ```bash
 pip install -r requirements.txt
 python project_code.py              # trains, writes submission.csv + outputs/
-python scripts/build_writeup.py     # rebuilds the PDF and Word writeups
 ```
